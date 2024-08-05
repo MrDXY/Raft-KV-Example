@@ -1,0 +1,17 @@
+syntax = "proto2";
+package walpb;
+
+import "gogoproto/gogo.proto";
+
+option go_package = "/walpb";
+
+option (gogoproto.marshaler_all) = true;
+option (gogoproto.sizer_all) = true;
+option (gogoproto.unmarshaler_all) = true;
+option (gogoproto.goproto_getters_all) = false;
+
+message Record {
+  optional int64 type  = 1 [(gogoproto.nullable) = false];
+  optional uint32 crc  = 2 [(gogoproto.nullable) = false];
+  optional bytes data  = 3;
+}
