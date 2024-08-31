@@ -91,6 +91,10 @@ func (lw *LogFileWriter) CurOffset() (int64, error) {
 	return lw.file.Seek(0, io.SeekCurrent)
 }
 
+func (lw *LogFileWriter) Close() error {
+	return lw.file.Close()
+}
+
 func prepareDataWithPadding(data []byte) ([]byte, uint64) {
 	lenField, padBytes := encodeFrameSize(len(data))
 	if padBytes != 0 {

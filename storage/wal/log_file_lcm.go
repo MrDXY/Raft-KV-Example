@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"github.com/mrdxy/raft-kv-example/pb/walpb"
 	"github.com/mrdxy/raft-kv-example/util"
 	"io"
 	"os"
@@ -162,10 +163,23 @@ func initialLogFile(dir string, fileSize int64) (*os.File, error) {
 	}
 	tailName := filepath.Join(tmpdirpath, FileName(0, 0))
 	f, err := util.OpenFile(tailName, os.O_WRONLY|os.O_CREATE, util.PrivateFileMode)
+	// TODO replace err with log.Fatal
 	if err != nil {
 		return nil, err
 	}
 	err = util.Preallocate(f, fileSize, true)
+	// init with empty snap entry
+	fw, err := NewLogFileWriter(f, 0)
+	if err != nil {
+		return nil, err
+	}
+	s := raftpb.Snapshot{}
+	sbyte, _ := s.Marshal()
+	err = fw.Write(&walpb.Record{Type: SnapshotType, Data: sbyte})
+	if err != nil {
+		return nil, err
+	}
+	err = fw.Sync()
 	if err != nil {
 		return nil, err
 	}

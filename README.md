@@ -58,21 +58,51 @@ The system architecture is divided into several key components, as illustrated i
 
 To run the server, the following steps will guide you through the setup and execution:
 
-1. **Build the Project**:
-    - Use the Go build tool to compile the project. Ensure that all dependencies are correctly installed.
 
-2. **Start the Server**:
-    - You can start the server using the following command:
+### Three Nodes Raft Cluster
 
-      ```bash
-      go run main.go start-server --id=1 --peer-port=2380 --client-port=2379 --peers=http://localhost:2380
-      ```
+To start all three server nodes simultaneously, use:
+```shell
+make run-all
+```
 
-    - The above command initializes the server with:
-        - `--id`: The unique identifier for the server.
-        - `--peer-port`: The port used for communication with other peers in the cluster.
-        - `--client-port`: The port used for communication with clients.
-        - `--peers`: A list of peer URLs that the server will communicate with.
+This will start:
+- Node 1 with `PeerPort=2380` and `ClientPort=2379`
+- Node 2 with `PeerPort=12380` and `ClientPort=12379`
+- Node 3 with `PeerPort=22380` and `ClientPort=22379`
+
+#### Stop a Specific Node in Cluster
+
+To stop a specific node, for instance, Node 2, use:
+```shell
+make stop-node2
+```
+
+#### Restart a Specific Node in Cluster
+To restart a specific node, for instance, Node 2, use:
+```shell
+make start-node2
+```
+
+### Single Node Cluster
+
+To start a specific node, for example, Node 1, use:
+```shell
+make run-single
+```
+
+### Send KV Requests
+
+#### Send a `PUT` Request to a Node
+```shell
+make put-node PORT=2379 DATA="key1=val1"
+```
+
+#### Send a `GET` Request to a Node
+```shell
+make get-node PORT=2379 DATA="key1"
+```
+
 ---
 
 ## Conclusion
