@@ -19,39 +19,14 @@ The system architecture is divided into several key components, as illustrated i
     - **Unstable Storage**: This is where entries and snapshots are temporarily stored during the Raft process. Entries are commands proposed by clients, and snapshots are compacted state representations.
     - **Ready**: This component is responsible for processing entries and snapshots, preparing them for commit or communication with peers.
     - **Memory Storage**: This represents the in-memory state of the persisted entries and snapshots. It mirrors the data persisted in the underlying file system, ensuring consistency between the in-memory state and the disk.
-    - **Snapshot**: Snapshots capture the state of the Raft state machine at a specific point in time. Along with the Write-Ahead Log (WAL), snapshots allow the system to recover the Raft state machine's state after a failure.
 
-3. **Commit Process**:
-    - Once the entries are committed, they are sent to the backend for apply.
-
-4. **Peer Transport**:
+3. **Peer Transport**:
     - This layer handles communication between different nodes in the Raft cluster, ensuring consistency and coordination across all participating nodes.
 
-5. **Backend Storage**:
+4. **Disk Storage**:
     - **WAL (Write-Ahead Log) File**: The WAL file persists all entries sequentially to ensure data integrity in case of a crash.
     - **Snapshot File**: The snapshot file stores compacted data from the memory storage, providing a way to recover the state of the system without replaying all WAL entries.
-    - **Database (.db)**: Optionally, a database (such as BoltDB in ETCD's implementation) may be used for additional disk-based storage. This provides persistent storage for committed key-value pairs and can be used in conjunction with WAL and snapshots.
-
----
-
-## How It Works
-
-1. **Proposing New Entries**:
-    - When a client proposes a new entry (a key-value pair or a config change), the KV transport layer passes it to the Raft model.
-    - The entry is first stored in the unstable storage.
-
-2. **Processing Entries**:
-    - The Raft model prepares entries and snapshots in the "Ready" component. These are then either committed locally or sent to other peers for consensus.
-
-3. **Commit and Persistence**:
-    - Once consensus is reached, the entry is committed and persisted to the backend storage. This includes writing to the WAL file and potentially creating a new snapshot.
-
-4. **Recovery**:
-    - In case of a restart, the system loads the WAL and snapshot files to restore the last consistent state of the KV storage.
-
-5. **Memory Store**:
-    - The memory store maintains the current state of the system in RAM, mirroring what is stored on disk. This ensures that the system can efficiently access and manipulate the state.
-
+    - **Database (.db)**: Optionally, a database (such as BoltDB in ETCD's implementation) may be used for additional disk-based storage. This provides persistent storage of the state machine.
 ---
 
 ## Running the System
