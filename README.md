@@ -6,6 +6,8 @@
 
 This project is a simplified implementation of a key-value (KV) storage system built on top of the ETCD Raft consensus algorithm. It serves as an educational tool to understand the interaction between the Raft consensus model and the upper-layer KV storage system.
 
+If you are not familiar with raft, here is my understanding on [how raft works](./doc/how%20raft%20algorithm%20works_zh.md). (Basically, it’s just a Chinese translation of the Raft paper.)
+
 ---
 
 ## Architecture Overview
