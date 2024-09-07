@@ -23,7 +23,7 @@ type Server struct {
 func NewServer(config *Config) *Server {
 	b := backend.NewInMemoryBackend()
 	r := raft.NewRaftNode(config.Id, config.PeerPort, config.Peers, false, b.CreateSnap)
-	c := client_transport.NewHttpClientTransport(config.ClientPort, r.ClientPropose, r.ClientCCPropose, b)
+	c := client_transport.NewHttpClientTransport(config.ClientPort, r.ClientPropose, r.ClientCCPropose, r.ClientReadIndex, b)
 	return &Server{
 		ct:      c,
 		r:       r,

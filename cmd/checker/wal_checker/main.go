@@ -4,6 +4,7 @@ import (
 	"flag"
 	"github.com/mrdxy/raft-kv-example/storage/snapshot"
 	"github.com/mrdxy/raft-kv-example/storage/wal"
+	"go.etcd.io/raft/v3/raftpb"
 	"log"
 )
 
@@ -14,7 +15,11 @@ func main() {
 	w := wal.NewReadOnlyFileWal(*waldir)
 	snapshotter := snapshot.NewFileSnapshot(*snapdir)
 	s, err := snapshotter.Load()
-	st, ents, err := w.Read(s)
+	snap := &raftpb.Snapshot{}
+	if s != nil {
+		snap = s
+	}
+	st, ents, err := w.Read(snap)
 	if err != nil {
 		log.Fatalf("error: %v\n", err)
 	}

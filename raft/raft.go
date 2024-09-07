@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/mrdxy/raft-kv-example/pkg/wait"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/mrdxy/raft-kv-example/storage/snapshot"
@@ -20,6 +22,8 @@ type Raft interface {
 	// TODO wrap with response to notify whether operation success or failed
 	ClientPropose(ctx context.Context, data []byte) error
 	ClientCCPropose(ctx context.Context, cc raftpb.ConfChange) error
+	ClientReadIndex(ctx context.Context) error
+
 	PeerProcess(ctx context.Context, m raftpb.Message) error
 
 	CommitC() <-chan *Commit
@@ -32,9 +36,36 @@ type Raft interface {
 	//ReportSnapshot(id uint64, status raft.SnapshotStatus)
 }
 
+type CommitType int
+
+const (
+	CommitEntry = iota
+	CommitSnapshot
+)
+
+type ApplyProgress struct {
+	ApplyWait wait.WaitTime
+	// TODO AppliedIndex should be handled within one single goroutine,
+	// to ensure it won't get back to a older version
+	AppliedIndex uint64
+}
+
+type EntryCommitData struct {
+	Data  []byte
+	Index uint64
+}
+
+type SnapCommitData struct {
+	Data  []byte
+	Index uint64
+}
+
 type Commit struct {
-	Data       []string
-	ApplyDoneC chan<- struct{}
+	EntryData     []EntryCommitData
+	SnapData      SnapCommitData
+	Type          CommitType
+	ApplyDoneC    chan<- struct{}
+	ApplyProgress *ApplyProgress
 }
 
 type raftNode struct {
@@ -50,9 +81,13 @@ type raftNode struct {
 	getSnapshot func() ([]byte, error)
 	snapCount   uint64
 
+	readIdxLock sync.Mutex
+	readIdxMap  map[uint64]chan struct{}
+	idGen       *util.SnowflakeIDGenerator
+
 	confState     raftpb.ConfState
 	snapshotIndex uint64
-	appliedIndex  uint64
+	applyProcess  *ApplyProgress
 
 	// raft backing for the Commit/error channel
 	node    raft.Node
@@ -83,6 +118,9 @@ func NewRaftNode(id, port int, peers []string, join bool, getSnapshot func() ([]
 		snapCount:        defaultSnapshotCount,
 		snapshotterReady: make(chan snapshot.Snapshotter, 1),
 		stopc:            make(chan struct{}),
+		applyProcess:     &ApplyProgress{ApplyWait: wait.NewTimeList()},
+		readIdxMap:       make(map[uint64]chan struct{}),
+		idGen:            util.NewSnowflakeIDGenerator(uint64(id)),
 		// rest of structure populated after WAL replay
 	}
 }
@@ -105,6 +143,35 @@ func (rc *raftNode) ClientPropose(ctx context.Context, data []byte) error {
 
 func (rc *raftNode) ClientCCPropose(ctx context.Context, cc raftpb.ConfChange) error {
 	return rc.node.ProposeConfChange(ctx, cc)
+}
+
+func (rc *raftNode) ClientReadIndex(ctx context.Context) error {
+	// 1. generate id
+	requestID := rc.idGen.GenerateID()
+
+	// 2. send read index requst
+	err := rc.node.ReadIndex(ctx, util.Int64ToBytes(requestID))
+	if err != nil {
+		return err
+	}
+
+	// 3. add channel to read map
+	readC := make(chan struct{})
+	rc.readIdxLock.Lock()
+	rc.readIdxMap[requestID] = readC
+	rc.readIdxLock.Unlock()
+
+	// 4. wait to be notified
+	select {
+	case <-readC:
+		return nil
+		// TODO need evaluate those timeout parameters, if I have more time
+	case <-time.After(500 * time.Millisecond):
+		rc.readIdxLock.Lock()
+		delete(rc.readIdxMap, requestID)
+		rc.readIdxLock.Unlock()
+		return errors.New("read index request timed out")
+	}
 }
 
 func (rc *raftNode) StartRaft() {
@@ -173,7 +240,8 @@ func (rc *raftNode) replay(s *raftpb.Snapshot, h raftpb.HardState, e []raftpb.En
 		}
 		rc.confState = s.Metadata.ConfState
 		rc.snapshotIndex = s.Metadata.Index
-		rc.appliedIndex = s.Metadata.Index
+		rc.applyProcess.AppliedIndex = s.Metadata.Index
+		rc.applyProcess.ApplyWait.Trigger(s.Metadata.Index)
 	}
 	err := rc.raftStorage.SetHardState(h)
 	if err != nil {
@@ -181,6 +249,7 @@ func (rc *raftNode) replay(s *raftpb.Snapshot, h raftpb.HardState, e []raftpb.En
 	}
 
 	// append to storage so raft starts at the right place in log
+	// Do not update applied index here, it will cause the ready to ignore logs
 	err = rc.raftStorage.Append(e)
 	if err != nil {
 		log.Fatalf("failed to replay Entries (%v)", err)
@@ -258,6 +327,11 @@ func (rc *raftNode) cleanup() {
 }
 
 func (rc *raftNode) processRaftReady(rd raft.Ready) {
+	// handle read index status
+	if len(rd.ReadStates) != 0 {
+		rc.processReadStatus(rd.ReadStates)
+	}
+
 	// update snapshot file and wal file
 	if !raft.IsEmptySnap(rd.Snapshot) {
 		rc.saveSnap(&rd.Snapshot)
@@ -273,7 +347,11 @@ func (rc *raftNode) processRaftReady(rd raft.Ready) {
 		if err != nil {
 			log.Fatalf("Failed to apply snapshot: %v", err)
 		}
-		rc.publishSnapshot(rd.Snapshot)
+		ok := rc.publishSnapshot(rd.Snapshot)
+		if !ok {
+			rc.stop()
+			return
+		}
 	}
 	// apply entries to raftStorage and backend
 	if err := rc.raftStorage.Append(rd.Entries); err != nil {
@@ -285,6 +363,7 @@ func (rc *raftNode) processRaftReady(rd raft.Ready) {
 		rc.stop()
 		return
 	}
+
 	rc.maybeTriggerSnapshot(applyDoneC)
 	rc.node.Advance()
 }
@@ -310,15 +389,15 @@ func (rc *raftNode) entriesToApply(ents []raftpb.Entry) (nents []raftpb.Entry) {
 	// new ent:            ----
 	//               |gap|
 	// applied: ----
-	if firstIdx > rc.appliedIndex+1 {
-		log.Fatalf("first index of committed entry[%d] should <= progress.appliedIndex[%d]+1", firstIdx, rc.appliedIndex)
+	if firstIdx > rc.applyProcess.AppliedIndex+1 {
+		log.Fatalf("first index of committed entry[%d] should <= progress.appliedIndex[%d]+1", firstIdx, rc.applyProcess.AppliedIndex)
 	}
 	// ensures the following case, no new entries
 	// new ent:    ----
 	//             |     |
 	// applied: ----------
-	if rc.appliedIndex-firstIdx+1 < uint64(len(ents)) {
-		nents = ents[rc.appliedIndex-firstIdx+1:]
+	if rc.applyProcess.AppliedIndex-firstIdx+1 < uint64(len(ents)) {
+		nents = ents[rc.applyProcess.AppliedIndex-firstIdx+1:]
 	}
 	return nents
 }
@@ -330,17 +409,22 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 		return nil, true
 	}
 
-	data := make([]string, 0, len(ents))
+	data := make([]EntryCommitData, 0, len(ents))
 	for i := range ents {
 		switch ents[i].Type {
 		case raftpb.EntryNormal:
-			if len(ents[i].Data) == 0 {
-				// ignore empty messages
-				break
-			}
-			s := string(ents[i].Data)
-			data = append(data, s)
+			data = append(data, EntryCommitData{Data: ents[i].Data, Index: ents[i].Index})
 		case raftpb.EntryConfChange:
+			// send and wait previous data, to ensure applyIndex can be set correctly, rather than overwrite
+			if len(data) > 0 {
+				applyDoneC := rc.batchPublishDataEntries(data)
+				select {
+				case <-applyDoneC:
+				case <-rc.stopc:
+				}
+				data = make([]EntryCommitData, 0, len(ents)-len(data))
+			}
+
 			var cc raftpb.ConfChange
 			cc.Unmarshal(ents[i].Data)
 			rc.confState = *rc.node.ApplyConfChange(cc)
@@ -356,42 +440,63 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) (<-chan struct{}, bool) 
 				}
 				rc.transport.RemovePeer(cc.NodeID)
 			}
+			rc.applyProcess.AppliedIndex = ents[i].Index
 		}
 	}
 
 	var applyDoneC chan struct{}
-
 	if len(data) > 0 {
 		applyDoneC = make(chan struct{}, 1)
 		select {
-		case rc.commitC <- &Commit{data, applyDoneC}:
+		case rc.commitC <- &Commit{data, SnapCommitData{}, CommitEntry, applyDoneC, rc.applyProcess}:
 		case <-rc.stopc:
 			return nil, false
 		}
 	}
-
-	// after commit, update appliedIndex
-	rc.appliedIndex = ents[len(ents)-1].Index
-
 	return applyDoneC, true
 }
 
-func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
+func (rc *raftNode) batchPublishDataEntries(data []EntryCommitData) <-chan struct{} {
+	var applyDoneC = make(chan struct{}, 1)
+	select {
+	case rc.commitC <- &Commit{data, SnapCommitData{}, CommitEntry, applyDoneC, rc.applyProcess}:
+	case <-rc.stopc:
+	}
+	return applyDoneC
+}
+
+func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) bool {
 	if raft.IsEmptySnap(snapshotToSave) {
-		return
+		return true
 	}
 
 	log.Printf("publishing snapshot at index %d", rc.snapshotIndex)
 	defer log.Printf("finished publishing snapshot at index %d", rc.snapshotIndex)
 
-	if snapshotToSave.Metadata.Index <= rc.appliedIndex {
-		log.Fatalf("snapshot index [%d] should > progress.appliedIndex [%d]", snapshotToSave.Metadata.Index, rc.appliedIndex)
+	if snapshotToSave.Metadata.Index <= rc.applyProcess.AppliedIndex {
+		log.Fatalf("snapshot index [%d] should > progress.appliedIndex [%d]", snapshotToSave.Metadata.Index, rc.applyProcess.AppliedIndex)
 	}
-	rc.commitC <- nil // trigger kvstore to load snapshot
+
+	var applyDoneC = make(chan struct{}, 1)
+	select {
+	// TODO directly deliver the snapshot to backend
+	case rc.commitC <- &Commit{nil, SnapCommitData{Data: snapshotToSave.Data, Index: snapshotToSave.Metadata.Index}, CommitSnapshot, applyDoneC, rc.applyProcess}: // trigger kvstore to load snapshot
+	case <-rc.stopc:
+		return false
+	}
+
+	// readWait until snapshot are applied (or server is closed)
+	if applyDoneC != nil {
+		select {
+		case <-applyDoneC:
+		case <-rc.stopc:
+			return false
+		}
+	}
 
 	rc.confState = snapshotToSave.Metadata.ConfState
 	rc.snapshotIndex = snapshotToSave.Metadata.Index
-	rc.appliedIndex = snapshotToSave.Metadata.Index
+	return true
 }
 
 // When there is a `raftpb.EntryConfChange` after creating the snapshot,
@@ -406,6 +511,37 @@ func (rc *raftNode) processMessages(ms []raftpb.Message) []raftpb.Message {
 	return ms
 }
 
+// processReadStatus will handle the read index responses.
+func (rc *raftNode) processReadStatus(states []raft.ReadState) {
+	for _, state := range states {
+		go func(state raft.ReadState) {
+			if rc.applyProcess.AppliedIndex < state.Index {
+				log.Printf("state index smaller than applied index: %v, raft index: %v \n", state.Index, rc.applyProcess.AppliedIndex)
+				select {
+				case <-rc.applyProcess.ApplyWait.Wait(state.Index):
+					requestId := util.BytesToInt64(state.RequestCtx)
+					rc.readIdxLock.Lock()
+					if readC, ok := rc.readIdxMap[requestId]; ok {
+						readC <- struct{}{}
+						delete(rc.readIdxMap, requestId)
+					}
+					rc.readIdxLock.Unlock()
+				case <-time.After(500 * time.Millisecond):
+					log.Panicf("Timeout waiting for index %d to be applied\n", state.Index)
+				}
+			} else {
+				requestId := util.BytesToInt64(state.RequestCtx)
+				rc.readIdxLock.Lock()
+				if readC, ok := rc.readIdxMap[requestId]; ok {
+					readC <- struct{}{}
+					delete(rc.readIdxMap, requestId)
+				}
+				rc.readIdxLock.Unlock()
+			}
+		}(state)
+	}
+}
+
 // stop closes http, closes all channels, and stops raft.
 func (rc *raftNode) stop() {
 	rc.transport.Stop()
@@ -417,11 +553,11 @@ func (rc *raftNode) stop() {
 var snapshotCatchUpEntriesN uint64 = 10000
 
 func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
-	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
+	if rc.applyProcess.AppliedIndex-rc.snapshotIndex <= rc.snapCount {
 		return
 	}
 
-	// wait until all committed entries are applied (or server is closed)
+	// readWait until all committed entries are applied (or server is closed)
 	if applyDoneC != nil {
 		select {
 		case <-applyDoneC:
@@ -429,21 +565,20 @@ func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 			return
 		}
 	}
-
-	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
+	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.applyProcess.AppliedIndex, rc.snapshotIndex)
 	data, err := rc.getSnapshot()
 	if err != nil {
 		log.Panic(err)
 	}
-	snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex, &rc.confState, data)
+	snap, err := rc.raftStorage.CreateSnapshot(rc.applyProcess.AppliedIndex, &rc.confState, data)
 	if err != nil {
 		panic(err)
 	}
 	rc.saveSnap(&snap)
 
 	compactIndex := uint64(1)
-	if rc.appliedIndex > snapshotCatchUpEntriesN {
-		compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN
+	if rc.applyProcess.AppliedIndex > snapshotCatchUpEntriesN {
+		compactIndex = rc.applyProcess.AppliedIndex - snapshotCatchUpEntriesN
 	}
 	if err := rc.raftStorage.Compact(compactIndex); err != nil {
 		if !errors.Is(err, raft.ErrCompacted) {
@@ -453,5 +588,5 @@ func (rc *raftNode) maybeTriggerSnapshot(applyDoneC <-chan struct{}) {
 		log.Printf("compacted log at index %d", compactIndex)
 	}
 
-	rc.snapshotIndex = rc.appliedIndex
+	rc.snapshotIndex = rc.applyProcess.AppliedIndex
 }

@@ -37,16 +37,19 @@ type HttpClientTransport struct {
 	store       backend.Backend
 	rPropose    func(ctx context.Context, data []byte) error          // raft propose handler
 	rConfChange func(ctx context.Context, cc raftpb.ConfChange) error // raft config change handler
+	rReadIndex  func(ctx context.Context) error                       // request for read index
 }
 
 func NewHttpClientTransport(port int,
 	rPropose func(ctx context.Context, data []byte) error,
 	rConfChange func(ctx context.Context, cc raftpb.ConfChange) error,
+	rReadIndex func(ctx context.Context) error,
 	store backend.Backend) ClientTransport {
 	t := &HttpClientTransport{
 		store:       store,
 		rPropose:    rPropose,
 		rConfChange: rConfChange,
+		rReadIndex:  rReadIndex,
 	}
 	t.transport = &http.Transport{
 		DialContext: (&net.Dialer{
@@ -62,7 +65,10 @@ func NewHttpClientTransport(port int,
 }
 
 func (h *HttpClientTransport) handleGet(key string) (string, bool) {
-	// TODO linearizable read
+	err := h.rReadIndex(context.TODO())
+	if err != nil {
+		return err.Error(), false
+	}
 	return h.store.Get(key)
 }
 
@@ -136,6 +142,7 @@ func (h *HttpClientTransport) handleKVRequests(w http.ResponseWriter, r *http.Re
 		if v, ok := h.handleGet(key); ok {
 			w.Write([]byte(v))
 		} else {
+			w.Write([]byte(v))
 			http.Error(w, "Failed to GET", http.StatusNotFound)
 		}
 	default:

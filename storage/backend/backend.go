@@ -52,21 +52,34 @@ func (b *InMemoryBackend) Start(commitC <-chan *raft.Commit, snapshotterC <-chan
 
 func (b *InMemoryBackend) consumeCommit(commitC <-chan *raft.Commit) {
 	for commit := range commitC {
-		if commit == nil {
-			// signaled to load snapshot
-			err := b.loadSnap()
-			if err != nil {
-				log.Panic("failed to load snapshot")
-			}
-			continue
-		}
-
-		for _, data := range commit.Data {
-			kv, err := DecodeKV([]byte(data))
-			if err != nil {
+		// TODO enable this comment, you can delay here to make the (applied index) < (read index), to testify the correctness of linearizability
+		//time.Sleep(200 * time.Millisecond)
+		switch commit.Type {
+		case raft.CommitSnapshot:
+			if commit.SnapData.Data != nil && len(commit.SnapData.Data) != 0 {
+				var store = make(map[string]string)
+				if err := json.Unmarshal(commit.SnapData.Data, &store); err != nil {
+					log.Panicf("apply sanpshot failed, err: %v", err)
+				}
+				b.mu.Lock()
+				b.dataMap = store
+				b.mu.Unlock()
+				commit.ApplyProgress.AppliedIndex = commit.SnapData.Index
+				commit.ApplyProgress.ApplyWait.Trigger(commit.SnapData.Index)
 				return
 			}
-			b.put(kv.Key, kv.Val)
+		case raft.CommitEntry:
+			for _, data := range commit.EntryData {
+				if len(data.Data) != 0 {
+					kv, err := DecodeKV(data.Data)
+					if err != nil {
+						log.Fatalf("failed to decode KV, err: %v", err)
+					}
+					b.put(kv.Key, kv.Val)
+				}
+				commit.ApplyProgress.AppliedIndex = data.Index
+				commit.ApplyProgress.ApplyWait.Trigger(data.Index)
+			}
 		}
 		close(commit.ApplyDoneC)
 	}

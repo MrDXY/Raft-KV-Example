@@ -69,3 +69,5 @@ benchmark:
 		curl -X PUT http://localhost:2379/kv -d "key$$i=val$$i"; \
 	done
 	@echo "Benchmark completed."
+
+# TODO Verify the correctness of Linearize Read
